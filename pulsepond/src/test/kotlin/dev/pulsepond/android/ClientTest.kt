@@ -1,12 +1,19 @@
 package dev.pulsepond.android
 
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 public class ClientTest {
@@ -152,6 +159,77 @@ public class ClientTest {
         client.shutdown()
     }
 
+    @Test
+    public fun `rebuilds an event when reset wins a concurrent track`() = runBlocking {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val uuid = BlockingUuidGenerator(entered, release)
+        val transport = FakeTransport()
+        val client = testClient(uuid = uuid, transport = transport)
+        val executor = Executors.newSingleThreadExecutor()
+
+        try {
+            val tracked = executor.submit<String?> { client.track("app_open") }
+            assertTrue(entered.await(5, TimeUnit.SECONDS))
+            client.reset()
+            release.countDown()
+            assertNotNull(tracked.get(5, TimeUnit.SECONDS))
+            client.flush()
+
+            assertEquals(2, uuid.v7Calls.get())
+            assertEquals(
+                "00000000-0000-4000-8000-000000000003",
+                extractField(transport.requests.single().second, "anonymous_installation_id"),
+            )
+            client.shutdown()
+        } finally {
+            release.countDown()
+            executor.shutdownNow()
+        }
+    }
+
+    @Test
+    public fun `queued automatic flushes cannot bypass retry backoff`() = runBlocking {
+        val requestStarted = CountDownLatch(1)
+        val releaseResponse = CountDownLatch(1)
+        val requests = AtomicInteger()
+        val transport = PulsepondTransport { _, _ ->
+            val attempt = requests.incrementAndGet()
+            if (attempt == 1) {
+                requestStarted.countDown()
+                releaseResponse.await(5, TimeUnit.SECONDS)
+                TransportResult.Response(503, null)
+            } else {
+                TransportResult.Response(202, null)
+            }
+        }
+        val executor = Executors.newFixedThreadPool(4)
+        val dispatcher = executor.asCoroutineDispatcher()
+        val client = testClient(
+            config = testConfig(batchSize = 1, maxQueueSize = 10),
+            transport = transport,
+            dispatcher = dispatcher,
+        )
+
+        try {
+            client.track("first")
+            assertTrue(requestStarted.await(5, TimeUnit.SECONDS))
+            client.track("second")
+            client.track("third")
+            releaseResponse.countDown()
+            delay(200)
+
+            assertEquals(1, requests.get())
+            client.flush()
+            assertEquals(4, requests.get())
+            client.shutdown()
+        } finally {
+            releaseResponse.countDown()
+            dispatcher.close()
+            executor.shutdownNow()
+        }
+    }
+
     private fun extractField(body: String, field: String): String =
         Regex("\\\"$field\\\":\\\"([^\\\"]+)\\\"").find(body)?.groupValues?.get(1)
             ?: error("missing $field")
@@ -161,4 +239,27 @@ public class ClientTest {
             .findAll(body)
             .map { it.groupValues[1] }
             .toList()
+
+    private class BlockingUuidGenerator(
+        private val entered: CountDownLatch,
+        private val release: CountDownLatch,
+    ) : UuidGenerator {
+        private var v4Calls = 0
+        val v7Calls = AtomicInteger()
+
+        @Synchronized
+        override fun v4(): String {
+            v4Calls += 1
+            return "00000000-0000-4000-8000-${v4Calls.toString(16).padStart(12, '0')}"
+        }
+
+        override fun v7(timestampMs: Long): String {
+            val call = v7Calls.incrementAndGet()
+            if (call == 1) {
+                entered.countDown()
+                release.await(5, TimeUnit.SECONDS)
+            }
+            return "0194f677-6a3d-7000-8000-${call.toString(16).padStart(12, '0')}"
+        }
+    }
 }

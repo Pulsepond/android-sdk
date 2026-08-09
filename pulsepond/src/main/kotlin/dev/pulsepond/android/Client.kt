@@ -50,67 +50,75 @@ internal class PulsepondClientImpl(
     private var closed = false
 
     override fun track(eventName: String, properties: PulsepondProperties): String? {
-        val initiallyFull = synchronized(stateLock) {
-            if (closing || closed) {
-                throw PulsepondValidationException(
-                    "Pulsepond cannot track after shutdown has started",
-                )
+        while (true) {
+            val trackGeneration = synchronized(stateLock) {
+                if (closing || closed) {
+                    throw PulsepondValidationException(
+                        "Pulsepond cannot track after shutdown has started",
+                    )
+                }
+                if (queue.size >= config.maxQueueSize || queueBytes >= MAX_QUEUE_BYTES) null
+                else generation
             }
-            queue.size >= config.maxQueueSize || queueBytes >= MAX_QUEUE_BYTES
-        }
-        if (initiallyFull) {
-            reportQueueFull()
-            return null
-        }
+            if (trackGeneration == null) {
+                reportQueueFull()
+                return null
+            }
 
-        val nowMs = runtime.clock.nowMs()
-        val event = createEvent(
-            config = config,
-            eventId = runtime.uuid.v7(nowMs),
-            eventName = eventName,
-            occurredAtMs = nowMs,
-            identity = identity.current(nowMs),
-            properties = properties,
-        )
-        val eventBytes = event.serialized.utf8Size()
-        var queueFull = false
-        var flushImmediately = false
-        synchronized(stateLock) {
-            if (closing || closed) {
-                throw PulsepondValidationException(
-                    "Pulsepond cannot track after shutdown has started",
-                )
+            val nowMs = runtime.clock.nowMs()
+            val currentIdentity = identity.current(nowMs)
+            val event = createEvent(
+                config = config,
+                eventId = runtime.uuid.v7(nowMs),
+                eventName = eventName,
+                occurredAtMs = nowMs,
+                identity = currentIdentity,
+                properties = properties,
+            )
+            val eventBytes = event.serialized.utf8Size()
+            var generationChanged = false
+            var queueFull = false
+            var flushImmediately = false
+            synchronized(stateLock) {
+                if (closing || closed) {
+                    throw PulsepondValidationException(
+                        "Pulsepond cannot track after shutdown has started",
+                    )
+                }
+                if (generation != trackGeneration) {
+                    generationChanged = true
+                } else if (queue.size >= config.maxQueueSize ||
+                    queueBytes >= MAX_QUEUE_BYTES ||
+                    queueBytes + eventBytes > MAX_QUEUE_BYTES
+                ) {
+                    queueFull = true
+                } else {
+                    sequence += 1
+                    queue.addLast(
+                        QueuedEvent(
+                            eventId = event.eventId,
+                            serialized = event.serialized,
+                            serializedBytes = eventBytes,
+                            occurredAtMs = nowMs,
+                            sequence = sequence,
+                        ),
+                    )
+                    queueBytes += eventBytes
+                    flushImmediately = queue.size >= effectiveBatchSize
+                }
             }
-            if (queue.size >= config.maxQueueSize ||
-                queueBytes >= MAX_QUEUE_BYTES ||
-                queueBytes + eventBytes > MAX_QUEUE_BYTES
-            ) {
-                queueFull = true
+            if (generationChanged) continue
+            if (queueFull) {
+                reportQueueFull()
+                return null
+            }
+            if (flushImmediately) {
+                launchAutomaticFlush()
             } else {
-                sequence += 1
-                queue.addLast(
-                    QueuedEvent(
-                        eventId = event.eventId,
-                        serialized = event.serialized,
-                        serializedBytes = eventBytes,
-                        occurredAtMs = nowMs,
-                        sequence = sequence,
-                    ),
-                )
-                queueBytes += eventBytes
-                flushImmediately = queue.size >= effectiveBatchSize
+                scheduleFlush()
             }
+            return event.eventId
         }
-        if (queueFull) {
-            reportQueueFull()
-            return null
-        }
-        if (flushImmediately) {
-            launchAutomaticFlush()
-        } else {
-            scheduleFlush()
-        }
-        return event.eventId
     }
 
     override suspend fun flush() {
@@ -179,6 +187,7 @@ internal class PulsepondClientImpl(
                     ),
                 )
             }
+            identity.close()
             scope.cancel()
         }
     }
@@ -222,6 +231,7 @@ internal class PulsepondClientImpl(
     ) {
         if (automatic && synchronized(stateLock) { retryJob != null }) return
         deliveryMutex.withLock {
+            if (automatic && synchronized(stateLock) { retryJob != null }) return@withLock
             var sentBatches = 0
             while (true) {
                 val stale = dropStaleEvents()

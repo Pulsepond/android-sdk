@@ -86,6 +86,12 @@ val pulsepond = Pulsepond.create(
 )
 ```
 
+The Context overload is a suspending factory. Call it from an application-owned
+coroutine. It reads the small identity file on `Dispatchers.IO`; subsequent
+`track()` calls update memory synchronously and coalesce persistence through one
+background writer. `shutdown()` drains the last identity update before
+returning.
+
 Only random installation/session UUIDs and the last session activity time are
 stored in the application's `noBackupFilesDir`, which Android excludes from
 Auto Backup. Pending event payloads are never persisted. A session rotates

@@ -1,6 +1,7 @@
 package dev.pulsepond.android
 
 import java.util.ArrayDeque
+import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.Dispatchers
 
 internal const val TEST_WRITE_KEY: String =
@@ -62,13 +63,21 @@ internal fun testClient(
     transport: PulsepondTransport = FakeTransport(),
     uuid: UuidGenerator = FakeUuidGenerator(),
     storage: IdentityStorage = MemoryIdentityStorage(),
+    dispatcher: CoroutineDispatcher = Dispatchers.Unconfined,
 ): PulsepondClientImpl = PulsepondClientImpl(
     config = config,
     diagnostics = DiagnosticSink(config.onDiagnostic),
-    identity = IdentityManager(storage, uuid),
+    identity = IdentityManager(
+        initial = storage.read(),
+        uuid = uuid,
+        persistence = object : IdentityPersistenceWriter {
+            override fun submit(value: StoredIdentity) = storage.write(value)
+            override suspend fun close() = Unit
+        },
+    ),
     runtime = PulsepondRuntime(
         clock = clock,
-        dispatcher = Dispatchers.Unconfined,
+        dispatcher = dispatcher,
         transport = transport,
         uuid = uuid,
         jitter = RetryJitter { 30_000 },

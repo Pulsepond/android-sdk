@@ -6,6 +6,12 @@ import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.File
 import java.security.SecureRandom
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.launch
 
 private const val SESSION_TIMEOUT_MS: Long = 30 * 60 * 1_000
 private const val MAX_UUID_V7_TIMESTAMP: Long = 0xffffffffffff
@@ -27,8 +33,6 @@ internal interface IdentityStorage {
     fun read(): StoredIdentity
 
     fun write(value: StoredIdentity)
-
-    fun clear()
 }
 
 internal class MemoryIdentityStorage : IdentityStorage {
@@ -40,9 +44,6 @@ internal class MemoryIdentityStorage : IdentityStorage {
         this.value = value
     }
 
-    override fun clear() {
-        value = StoredIdentity(null, null, null)
-    }
 }
 
 internal class AndroidNoBackupIdentityStorage(
@@ -80,10 +81,6 @@ internal class AndroidNoBackupIdentityStorage(
         }
     }
 
-    override fun clear() {
-        file.delete()
-    }
-
     private fun DataInputStream.readNullableString(): String? =
         if (readBoolean()) readUTF() else null
 
@@ -112,14 +109,6 @@ internal class ResilientIdentityStorage(
         }
     }
 
-    @Synchronized
-    override fun clear() {
-        execute {
-            it.clear()
-            Unit
-        }
-    }
-
     private fun <T> execute(block: (IdentityStorage) -> T): T = try {
         block(active)
     } catch (_: Exception) {
@@ -133,14 +122,15 @@ internal class ResilientIdentityStorage(
 }
 
 internal class IdentityManager(
-    private val storage: IdentityStorage,
+    initial: StoredIdentity,
     private val uuid: UuidGenerator,
+    private val persistence: IdentityPersistenceWriter,
 ) {
-    private var cached: StoredIdentity? = null
+    private var cached: StoredIdentity = initial
 
     @Synchronized
     fun current(nowMs: Long): Identity {
-        val stored = cached ?: storage.read()
+        val stored = cached
         val installationId = stored.installationId
             ?.takeIf(::isCanonicalAnonymousId)
             ?: uuid.v4()
@@ -158,16 +148,53 @@ internal class IdentityManager(
         }
         val updated = StoredIdentity(installationId, sessionId, nowMs)
         cached = updated
-        storage.write(updated)
+        persistence.submit(updated)
         return Identity(installationId, sessionId)
     }
 
     @Synchronized
     fun reset(nowMs: Long) {
-        storage.clear()
         val updated = StoredIdentity(uuid.v4(), uuid.v4(), nowMs)
         cached = updated
-        storage.write(updated)
+        persistence.submit(updated)
+    }
+
+    suspend fun close() {
+        persistence.close()
+    }
+}
+
+internal interface IdentityPersistenceWriter {
+    fun submit(value: StoredIdentity)
+
+    suspend fun close()
+}
+
+internal object MemoryIdentityPersistenceWriter : IdentityPersistenceWriter {
+    override fun submit(value: StoredIdentity) = Unit
+
+    override suspend fun close() = Unit
+}
+
+internal class AsyncIdentityPersistenceWriter(
+    private val storage: IdentityStorage,
+    dispatcher: CoroutineDispatcher,
+) : IdentityPersistenceWriter {
+    private val updates = Channel<StoredIdentity>(Channel.CONFLATED)
+    private val scope = CoroutineScope(SupervisorJob() + dispatcher)
+    private val writer: Job = scope.launch {
+        for (value in updates) {
+            storage.write(value)
+        }
+    }
+
+    override fun submit(value: StoredIdentity) {
+        updates.trySend(value)
+    }
+
+    override suspend fun close() {
+        updates.close()
+        writer.join()
     }
 }
 
