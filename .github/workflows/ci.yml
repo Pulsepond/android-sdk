@@ -16,7 +16,8 @@ permissions:
 
 jobs:
   validate:
-    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: [self-hosted, azure]
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -26,7 +27,10 @@ jobs:
         with:
           distribution: temurin
           java-version: "17"
+      - name: Set up Android SDK 37
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          packages: "platform-tools platforms;android-37"
       - uses: gradle/actions/setup-gradle@67621b124fd2e251c5e8a0e6e3b91318f2287669 # v6.3.0
       - name: Validate
         run: ./gradlew check lint publishToMavenLocal --no-daemon
-
