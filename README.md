@@ -1,7 +1,7 @@
 # Pulsepond Android SDK
 
 > [!IMPORTANT]
-> This repository is archived and receives no further releases. Android and
+> This repository is being archived and receives no further releases. Android and
 > iOS now share the reviewed delivery core in
 > [`Pulsepond/mobile-sdk`](https://github.com/Pulsepond/mobile-sdk). Android
 > applications should use `dev.pulsepond:pulsepond`; its public API and durable
